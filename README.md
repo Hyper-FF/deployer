@@ -1,109 +1,118 @@
 # StarRocks Docker Deployer
 
-One-click Docker deployment for StarRocks clusters. Supports both **single-node**
-(allin1 image, FE + BE + feproxy in one container) and **multi-node** (separate
-FE / BE containers, configurable count) deployments from the same CLI.
+One-click Docker deployment for a StarRocks cluster **from a user-supplied
+installation tarball** — no public image pulls. Supports both single-node
+(FE=1 + BE=1) and multi-node (configurable N FE + M BE) topologies from the
+same CLI.
+
+## How it works
+
+1. You drop a custom StarRocks tarball into `./packages/`.
+2. `deploy.sh` builds a local runtime image (`runtime/Dockerfile`): a slim
+   JDK base + the unpacked tarball + thin FE/BE entrypoints.
+3. `deploy.sh` renders a docker-compose file for the requested number of FE
+   and BE containers and brings the cluster up. FE-0 bootstraps; the others
+   join as followers via `ALTER SYSTEM ADD FOLLOWER`; BEs register via
+   `ALTER SYSTEM ADD BACKEND`.
 
 ## Prerequisites
 
-- Docker 20.10+ with the Compose plugin (`docker compose`) — or legacy
-  `docker-compose` is also accepted.
-- Outbound access to Docker Hub (or a mirror) for the
-  `starrocks/allin1-ubuntu`, `starrocks/fe-ubuntu`, and `starrocks/be-ubuntu`
-  images.
-- Linux/macOS host with at least 4 GB RAM free for a single-node cluster, or
-  ~2 GB per FE/BE container for multi-node.
+- Docker 20.10+ with the Compose plugin (`docker compose`) or legacy
+  `docker-compose`.
+- A StarRocks tarball whose top-level directory contains `fe/` and `be/`
+  subdirectories — i.e. the standard layout produced by StarRocks' build
+  pipeline. Quick check on your tarball:
+  ```bash
+  tar -tzf packages/StarRocks-x.y.z.tar.gz | head
+  # expected first lines:
+  # StarRocks-x.y.z/
+  # StarRocks-x.y.z/fe/...
+  # StarRocks-x.y.z/be/...
+  ```
+- Around 4 GB RAM free for a 1FE+1BE cluster, or ~2 GB per FE/BE container
+  for larger topologies.
 
 ## Quick start
 
 ```bash
-# 1. Configure (optional — defaults work)
+# 1. Configure
 cp .env.example .env
-$EDITOR .env
+$EDITOR .env                       # set PACKAGE_FILE, FE_COUNT, BE_COUNT, ...
 
-# 2a. Single-node cluster
-./deploy.sh up --mode single
+# 2. Put your tarball in place
+cp /path/to/StarRocks-3.4.0.tar.gz packages/
 
-# 2b. Multi-node cluster (3 FE + 3 BE by default; tune with --fe / --be or .env)
+# 3. Deploy (image is built automatically on first run)
+./deploy.sh up                     # honours FE_COUNT/BE_COUNT from .env
+./deploy.sh up --mode single       # alias for --fe 1 --be 1
 ./deploy.sh up --mode multi --fe 3 --be 3
 
-# 3. Connect
-mysql -h 127.0.0.1 -P 9030 -u root
+# 4. Connect
+./deploy.sh sql                    # interactive MySQL shell on FE-0
 # or
-./deploy.sh sql
+mysql -h 127.0.0.1 -P 9030 -u root
 ```
-
-If `--mode` is omitted, the deployer auto-selects: `FE_COUNT=1` and
-`BE_COUNT=1` give single-node, otherwise multi-node.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `./deploy.sh up [--mode single\|multi] [--fe N] [--be M]` | Deploy the cluster, wait for it to become ready, optionally set the root password. |
-| `./deploy.sh down [--volumes]` | Stop and remove containers. With `--volumes` also deletes the data volumes. |
-| `./deploy.sh status` | Show container status for the active deployment. |
-| `./deploy.sh logs [service]` | Tail logs (follow). Optional service name(s) filter. |
-| `./deploy.sh sql` | Open an interactive MySQL shell against the leader FE. |
+| `./deploy.sh build [--no-cache]` | Build the runtime image from `packages/$PACKAGE_FILE`. |
+| `./deploy.sh up [--mode single\|multi] [--fe N] [--be M] [--build]` | Deploy. Builds the image first if it doesn't exist or `--build` is given. |
+| `./deploy.sh down [--volumes\|-v] [--image]` | Stop the cluster. `--volumes` deletes data, `--image` removes the runtime image. |
+| `./deploy.sh status` | Show container status. |
+| `./deploy.sh logs [service...]` | Tail logs (follows). |
+| `./deploy.sh sql` | Interactive MySQL shell on FE-0. |
 | `./deploy.sh restart` | Restart all containers in place. |
-| `./deploy.sh regen` | Re-render the multi-node compose file from `.env`. |
+| `./deploy.sh regen` | Re-render the compose file from `.env`. |
 
-## Configuration
-
-All knobs live in `.env`:
+## Configuration (`.env`)
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `STARROCKS_VERSION` | `latest` | Image tag (e.g. `3.4-latest`, `3.3.11`). |
-| `RUN_MODE` | `shared_nothing` | `shared_nothing` or `shared_data` (single-node only). |
-| `CLUSTER_NAME` | `starrocks` | Prefix for containers, network and volumes. |
-| `FE_COUNT` | `3` | Number of FE nodes (multi-node). Use odd numbers for quorum. |
-| `BE_COUNT` | `3` | Number of BE nodes (multi-node). |
+| `PACKAGE_FILE` | _(required)_ | Filename of the tarball under `./packages/`. |
+| `IMAGE_TAG` | `starrocks-local:latest` | Tag for the locally built runtime image. |
+| `BASE_IMAGE` | `eclipse-temurin:17-jdk-jammy` | JDK-bearing base image. |
+| `CLUSTER_NAME` | `starrocks` | Prefix for container, network and volume names. |
+| `FE_COUNT` | `3` | Number of FE nodes (use odd values for quorum). |
+| `BE_COUNT` | `3` | Number of BE nodes. |
 | `FE_QUERY_PORT` | `9030` | Host port mapped to FE-0 query port. |
 | `FE_HTTP_PORT` | `8030` | Host port mapped to FE-0 HTTP port. |
-| `ROOT_PASSWORD` | _(empty)_ | Set the `root` password automatically after first start. |
+| `ROOT_PASSWORD` | _(empty)_ | If set, `root` password is applied after first start. |
 
 `conf/fe.conf` and `conf/be.conf` are mounted read-only into every container
-via the in-image `CONFIGMAP_MOUNT_PATH` mechanism. Edit them to customise
-FE/BE settings and run `./deploy.sh restart`.
-
-## How it works
-
-- **Single-node** uses the official `starrocks/allin1-ubuntu` image, which
-  ships a supervisord-managed FE + BE + feproxy in one container.
-- **Multi-node** uses `starrocks/fe-ubuntu` and `starrocks/be-ubuntu` images.
-  The deployer renders a compose file with `FE_COUNT` FE containers
-  (`<cluster>-fe-0`..`<cluster>-fe-N`) and `BE_COUNT` BE containers,
-  all on a shared bridge network. The first FE (`-fe-0`) bootstraps as the
-  leader; later FEs auto-join as followers and BEs register themselves via
-  `ALTER SYSTEM ADD BACKEND`, driven by the entrypoints shipped in the
-  official images.
-
-After `up`, `./deploy.sh` polls `SHOW FRONTENDS` and `SHOW BACKENDS` until
-the expected number of nodes report `Alive=true`.
+at `/etc/starrocks/conf`. The entrypoints overlay them onto the bundled
+config at startup; run `./deploy.sh restart` to apply edits.
 
 ## Layout
 
 ```
 deployer/
-├── deploy.sh                 # main CLI
-├── .env.example              # configuration template
+├── deploy.sh                # main CLI
+├── .env.example             # configuration template
+├── packages/                # drop your StarRocks-*.tar.gz here  (git-ignored)
+├── runtime/
+│   ├── Dockerfile           # builds the runtime image from the tarball
+│   ├── fe-entrypoint.sh     # FE join/bootstrap logic
+│   └── be-entrypoint.sh     # BE auto-register logic
 ├── conf/
-│   ├── fe.conf               # FE config (mounted into every FE)
-│   └── be.conf               # BE config (mounted into every BE)
-├── compose/
-│   └── single-node.yml       # static allin1 compose file
+│   ├── fe.conf              # FE config overlay
+│   └── be.conf              # BE config overlay
 ├── scripts/
-│   ├── gen-multi-node.sh     # renders multi-node compose from .env
-│   └── wait-ready.sh         # polls cluster readiness
-└── generated/                # generated compose files + mode marker
+│   ├── gen-compose.sh       # renders the compose file from .env
+│   └── wait-ready.sh        # polls cluster readiness
+└── generated/               # generated compose file + deploy marker
 ```
 
 ## Notes
 
-- The deployer remembers the last-used mode under `generated/.mode`, so
-  `down`, `status`, `logs`, etc. work without re-specifying `--mode`.
-- `down --volumes` wipes all data (meta + storage). Without it the volumes
+- The image is rebuilt only when you pass `--build` or the image tag does
+  not exist locally. Bump `IMAGE_TAG` in `.env` when you ship a new tarball
+  to keep old and new builds side-by-side.
+- `down --volumes` wipes all FE meta and BE storage. Without it, volumes
   persist and the cluster can be brought back up with state intact.
-- For production, increase FE count to 3 or 5 (odd), provision separate
-  hosts, and configure storage paths in `conf/be.conf`.
+- The deployer assumes the tarball is for the same architecture as the host
+  (typically `linux/amd64`). For cross-arch deployments, set `BASE_IMAGE`
+  to an image matching the tarball's arch.
+- For production, run FE on 3 or 5 nodes (odd), use dedicated hosts, and
+  configure storage paths via `conf/be.conf`.

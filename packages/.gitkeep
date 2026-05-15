@@ -1,0 +1,2 @@
+# Drop your StarRocks tarball (e.g. StarRocks-3.4.0.tar.gz) here, then point
+# PACKAGE_FILE in .env at it.

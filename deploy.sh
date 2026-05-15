@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
 #
 # StarRocks Docker Deployer
-# One-click deployment of a StarRocks cluster in either single-node (allin1)
-# or multi-node mode (separate FE / BE containers).
+# One-click deployment of a StarRocks cluster from a user-supplied tarball,
+# in either single-node (FE=1 + BE=1) or multi-node (N FE + M BE) topology.
 #
-# Usage:
-#   ./deploy.sh up      [--mode single|multi] [--fe N] [--be M]
-#   ./deploy.sh down    [--volumes]
-#   ./deploy.sh status
-#   ./deploy.sh logs    [service]
-#   ./deploy.sh sql     [-- mysql args...]
-#   ./deploy.sh restart
-#   ./deploy.sh regen          # regenerate multi-node compose file from .env
+# Workflow:
+#   1. Drop StarRocks-x.y.z.tar.gz into ./packages/
+#   2. Edit .env (PACKAGE_FILE, FE_COUNT, BE_COUNT, ...)
+#   3. ./deploy.sh up
 #
 # Configuration lives in .env (see .env.example).
 
@@ -21,11 +17,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 ENV_FILE="$SCRIPT_DIR/.env"
-COMPOSE_DIR="$SCRIPT_DIR/compose"
 GENERATED_DIR="$SCRIPT_DIR/generated"
-SINGLE_COMPOSE="$COMPOSE_DIR/single-node.yml"
-MULTI_COMPOSE="$GENERATED_DIR/multi-node.yml"
-MODE_FILE="$GENERATED_DIR/.mode"
+COMPOSE_FILE="$GENERATED_DIR/cluster.yml"
+DEPLOY_MARKER="$GENERATED_DIR/.deployed"
+PACKAGES_DIR="$SCRIPT_DIR/packages"
 
 color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
 info()  { color "0;36" "==> $*"; }
@@ -41,16 +36,17 @@ ensure_env() {
     # shellcheck disable=SC1090
     . "$ENV_FILE"
     set +a
-    : "${STARROCKS_VERSION:=latest}"
-    : "${RUN_MODE:=shared_nothing}"
+    : "${PACKAGE_FILE:?PACKAGE_FILE must be set in .env}"
+    : "${IMAGE_TAG:=starrocks-local:latest}"
+    : "${BASE_IMAGE:=eclipse-temurin:17-jdk-jammy}"
     : "${CLUSTER_NAME:=starrocks}"
     : "${FE_COUNT:=3}"
     : "${BE_COUNT:=3}"
     : "${FE_QUERY_PORT:=9030}"
     : "${FE_HTTP_PORT:=8030}"
     : "${ROOT_PASSWORD:=}"
-    export STARROCKS_VERSION RUN_MODE CLUSTER_NAME FE_COUNT BE_COUNT \
-           FE_QUERY_PORT FE_HTTP_PORT ROOT_PASSWORD
+    export PACKAGE_FILE IMAGE_TAG BASE_IMAGE CLUSTER_NAME \
+           FE_COUNT BE_COUNT FE_QUERY_PORT FE_HTTP_PORT ROOT_PASSWORD
 }
 
 require_docker() {
@@ -64,32 +60,35 @@ require_docker() {
     fi
 }
 
-# ---- mode tracking ------------------------------------------------------------
+# ---- helpers ------------------------------------------------------------------
 
-save_mode() {
+regen_compose() {
     mkdir -p "$GENERATED_DIR"
-    echo "$1" > "$MODE_FILE"
+    bash "$SCRIPT_DIR/scripts/gen-compose.sh" > "$COMPOSE_FILE"
+    info "rendered $COMPOSE_FILE  (FE=$FE_COUNT, BE=$BE_COUNT)"
 }
 
-current_mode() {
-    [ -f "$MODE_FILE" ] && cat "$MODE_FILE" || echo ""
+image_exists() {
+    docker image inspect "$IMAGE_TAG" >/dev/null 2>&1
 }
 
-compose_file_for_mode() {
-    case "$1" in
-        single) echo "$SINGLE_COMPOSE" ;;
-        multi)  echo "$MULTI_COMPOSE" ;;
-        *)      die "unknown mode: $1" ;;
-    esac
+verify_package() {
+    local path="$PACKAGES_DIR/$PACKAGE_FILE"
+    [ -f "$path" ] || die "package not found: $path
+Put the StarRocks tarball into ./packages/ and set PACKAGE_FILE in .env."
+    # Quick structural check: expect a single top-level dir with fe/ and be/.
+    local entries
+    entries=$(tar -tzf "$path" 2>/dev/null | head -200 | awk -F/ '{print $1}' | sort -u | head -5)
+    local top
+    top=$(echo "$entries" | head -1)
+    [ -n "$top" ] || die "could not read tarball: $path"
+    if ! tar -tzf "$path" 2>/dev/null | grep -qE "^${top}/fe/bin/start_fe.sh\$"; then
+        die "tarball $PACKAGE_FILE does not contain ${top}/fe/bin/start_fe.sh"
+    fi
+    if ! tar -tzf "$path" 2>/dev/null | grep -qE "^${top}/be/bin/start_be.sh\$"; then
+        die "tarball $PACKAGE_FILE does not contain ${top}/be/bin/start_be.sh"
+    fi
 }
-
-regen_multi() {
-    mkdir -p "$GENERATED_DIR"
-    bash "$SCRIPT_DIR/scripts/gen-multi-node.sh" > "$MULTI_COMPOSE"
-    info "regenerated $MULTI_COMPOSE"
-}
-
-# ---- post-up actions ----------------------------------------------------------
 
 apply_root_password() {
     [ -z "$ROOT_PASSWORD" ] && return 0
@@ -100,16 +99,48 @@ apply_root_password() {
         >/dev/null 2>&1 || warn "could not set root password (it may already be set)"
 }
 
+mark_deployed() {
+    mkdir -p "$GENERATED_DIR"
+    touch "$DEPLOY_MARKER"
+}
+
+require_deployed() {
+    [ -f "$DEPLOY_MARKER" ] || die "cluster is not deployed (run './deploy.sh up' first)"
+    [ -f "$COMPOSE_FILE" ] || regen_compose
+}
+
 # ---- commands -----------------------------------------------------------------
 
-cmd_up() {
-    local mode=""
-    local fe_override="" be_override=""
+cmd_build() {
+    local no_cache=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --mode) mode="$2"; shift 2 ;;
-            --fe)   fe_override="$2"; shift 2 ;;
-            --be)   be_override="$2"; shift 2 ;;
+            --no-cache) no_cache=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+    ensure_env
+    require_docker
+    verify_package
+
+    info "building image $IMAGE_TAG from packages/$PACKAGE_FILE (base=$BASE_IMAGE)"
+    local args=(build -f runtime/Dockerfile -t "$IMAGE_TAG"
+                --build-arg "BASE_IMAGE=$BASE_IMAGE"
+                --build-arg "PACKAGE_FILE=$PACKAGE_FILE")
+    [ "$no_cache" -eq 1 ] && args+=(--no-cache)
+    docker "${args[@]}" "$SCRIPT_DIR"
+    info "image $IMAGE_TAG built"
+}
+
+cmd_up() {
+    local mode="" fe_override="" be_override="" force_build=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --mode)  mode="$2"; shift 2 ;;
+            --fe)    fe_override="$2"; shift 2 ;;
+            --be)    be_override="$2"; shift 2 ;;
+            --build) force_build=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -118,136 +149,120 @@ cmd_up() {
     ensure_env
     require_docker
 
-    [ -n "$fe_override" ] && export FE_COUNT="$fe_override"
-    [ -n "$be_override" ] && export BE_COUNT="$be_override"
-
-    if [ -z "$mode" ]; then
-        if [ "${FE_COUNT}" -eq 1 ] && [ "${BE_COUNT}" -eq 1 ]; then
-            mode="single"
-        else
-            mode="multi"
-        fi
-        info "auto-selected mode: $mode (FE_COUNT=$FE_COUNT, BE_COUNT=$BE_COUNT)"
-    fi
-
     case "$mode" in
-        single)
-            info "deploying single-node StarRocks (allin1, version=$STARROCKS_VERSION)"
-            "${COMPOSE[@]}" -f "$SINGLE_COMPOSE" --project-name "$CLUSTER_NAME" up -d
-            save_mode single
-            info "waiting for cluster to become ready..."
-            bash "$SCRIPT_DIR/scripts/wait-ready.sh" "${CLUSTER_NAME}-allin1" 1 1 300
-            apply_root_password "${CLUSTER_NAME}-allin1"
-            ;;
+        "")        ;;  # honour FE_COUNT/BE_COUNT from .env / overrides
+        single)    fe_override="${fe_override:-1}"; be_override="${be_override:-1}" ;;
         multi)
-            info "deploying multi-node StarRocks (FE=$FE_COUNT, BE=$BE_COUNT, version=$STARROCKS_VERSION)"
-            regen_multi
-            "${COMPOSE[@]}" -f "$MULTI_COMPOSE" --project-name "$CLUSTER_NAME" up -d
-            save_mode multi
-            info "waiting for cluster to become ready..."
-            bash "$SCRIPT_DIR/scripts/wait-ready.sh" "${CLUSTER_NAME}-fe-0" "$FE_COUNT" "$BE_COUNT" 600
-            apply_root_password "${CLUSTER_NAME}-fe-0"
+            # Only force defaults if the user has FE=1/BE=1 in .env, which would
+            # otherwise collapse to single-node.
+            [ "$FE_COUNT" -eq 1 ] && [ -z "$fe_override" ] && fe_override=3
+            [ "$BE_COUNT" -eq 1 ] && [ -z "$be_override" ] && be_override=3
             ;;
         *) die "invalid --mode: $mode (expected: single|multi)" ;;
     esac
+    [ -n "$fe_override" ] && export FE_COUNT="$fe_override"
+    [ -n "$be_override" ] && export BE_COUNT="$be_override"
+
+    if [ "$force_build" -eq 1 ] || ! image_exists; then
+        cmd_build
+    else
+        info "image $IMAGE_TAG already present (use --build to rebuild)"
+    fi
+
+    regen_compose
+    info "starting cluster ($CLUSTER_NAME): FE=$FE_COUNT, BE=$BE_COUNT"
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --project-name "$CLUSTER_NAME" up -d
+    mark_deployed
+
+    info "waiting for cluster to become ready..."
+    bash "$SCRIPT_DIR/scripts/wait-ready.sh" "${CLUSTER_NAME}-fe-0" \
+        "$FE_COUNT" "$BE_COUNT" 600
+    apply_root_password "${CLUSTER_NAME}-fe-0"
 
     info "StarRocks is up. Connect with:"
     echo "    mysql -h 127.0.0.1 -P ${FE_QUERY_PORT} -u root"
 }
 
 cmd_down() {
-    local prune_volumes=0
+    local prune_volumes=0 prune_image=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --volumes|-v) prune_volumes=1; shift ;;
+            --image)      prune_image=1; shift ;;
             *) die "unknown option: $1" ;;
         esac
     done
-    ensure_env
-    require_docker
-
-    local mode
-    mode="$(current_mode)"
-    [ -z "$mode" ] && { warn "no recorded mode; nothing to do."; return 0; }
-
-    local compose_file
-    compose_file="$(compose_file_for_mode "$mode")"
-    [ "$mode" = "multi" ] && [ ! -f "$compose_file" ] && regen_multi
+    ensure_env; require_docker
+    [ -f "$COMPOSE_FILE" ] || regen_compose
 
     local args=(down)
     [ "$prune_volumes" -eq 1 ] && args+=(-v)
-    info "stopping cluster (mode=$mode, volumes=$prune_volumes)"
-    "${COMPOSE[@]}" -f "$compose_file" --project-name "$CLUSTER_NAME" "${args[@]}"
-    [ "$prune_volumes" -eq 1 ] && rm -f "$MODE_FILE"
+    info "stopping cluster (volumes=$prune_volumes)"
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --project-name "$CLUSTER_NAME" "${args[@]}"
+    [ "$prune_volumes" -eq 1 ] && rm -f "$DEPLOY_MARKER"
+    if [ "$prune_image" -eq 1 ]; then
+        info "removing image $IMAGE_TAG"
+        docker image rm "$IMAGE_TAG" 2>/dev/null || warn "image $IMAGE_TAG was not present"
+    fi
 }
 
 cmd_status() {
     ensure_env; require_docker
-    local mode; mode="$(current_mode)"
-    [ -z "$mode" ] && { echo "cluster is not deployed."; return 0; }
-    local f; f="$(compose_file_for_mode "$mode")"
-    [ "$mode" = "multi" ] && [ ! -f "$f" ] && regen_multi
-    "${COMPOSE[@]}" -f "$f" --project-name "$CLUSTER_NAME" ps
+    [ -f "$DEPLOY_MARKER" ] || { echo "cluster is not deployed."; return 0; }
+    [ -f "$COMPOSE_FILE" ] || regen_compose
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --project-name "$CLUSTER_NAME" ps
 }
 
 cmd_logs() {
-    ensure_env; require_docker
-    local mode; mode="$(current_mode)"
-    [ -z "$mode" ] && die "cluster is not deployed."
-    local f; f="$(compose_file_for_mode "$mode")"
-    [ "$mode" = "multi" ] && [ ! -f "$f" ] && regen_multi
-    "${COMPOSE[@]}" -f "$f" --project-name "$CLUSTER_NAME" logs --tail=200 -f "$@"
+    ensure_env; require_docker; require_deployed
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --project-name "$CLUSTER_NAME" \
+        logs --tail=200 -f "$@"
 }
 
 cmd_sql() {
-    ensure_env; require_docker
-    local mode; mode="$(current_mode)"
-    local fe
-    case "$mode" in
-        single) fe="${CLUSTER_NAME}-allin1" ;;
-        multi)  fe="${CLUSTER_NAME}-fe-0" ;;
-        *)      die "cluster is not deployed." ;;
-    esac
+    ensure_env; require_docker; require_deployed
     local pwd_opt=()
     [ -n "$ROOT_PASSWORD" ] && pwd_opt=(-p"$ROOT_PASSWORD")
-    docker exec -it "$fe" mysql -h 127.0.0.1 -P 9030 -u root "${pwd_opt[@]}" "$@"
+    docker exec -it "${CLUSTER_NAME}-fe-0" \
+        mysql -h 127.0.0.1 -P 9030 -u root "${pwd_opt[@]}" "$@"
 }
 
 cmd_restart() {
-    ensure_env; require_docker
-    local mode; mode="$(current_mode)"
-    [ -z "$mode" ] && die "cluster is not deployed."
-    local f; f="$(compose_file_for_mode "$mode")"
-    [ "$mode" = "multi" ] && [ ! -f "$f" ] && regen_multi
-    "${COMPOSE[@]}" -f "$f" --project-name "$CLUSTER_NAME" restart
+    ensure_env; require_docker; require_deployed
+    "${COMPOSE[@]}" -f "$COMPOSE_FILE" --project-name "$CLUSTER_NAME" restart
+}
+
+cmd_regen() {
+    ensure_env
+    regen_compose
 }
 
 usage() {
     cat <<EOF
-StarRocks Docker Deployer
+StarRocks Docker Deployer (package-based)
+
+Workflow:
+  1. cp .env.example .env  &&  edit it
+  2. Place StarRocks-x.y.z.tar.gz into ./packages/
+  3. ./deploy.sh up
 
 Commands:
-  up [--mode single|multi] [--fe N] [--be M]
-        Deploy the cluster. Mode is auto-detected from FE_COUNT/BE_COUNT
-        in .env when omitted (FE=1 & BE=1 -> single, otherwise multi).
+  build [--no-cache]
+        Build the runtime image from ./packages/\${PACKAGE_FILE}.
 
-  down [--volumes|-v]
-        Stop and remove containers. With --volumes also deletes all data.
+  up [--mode single|multi] [--fe N] [--be M] [--build]
+        Deploy the cluster. Builds the image first if it does not exist
+        (or --build is given). --mode single forces FE=1,BE=1.
 
-  status
-        Show container status for the current cluster.
+  down [--volumes|-v] [--image]
+        Stop and remove containers. --volumes also deletes data volumes;
+        --image also removes the locally built runtime image.
 
-  logs [service...]
-        Tail container logs (follows). Pass service names to filter.
-
-  sql [-- mysql args...]
-        Open an interactive MySQL shell into the cluster's leader FE.
-
-  restart
-        Restart all containers without recreating them.
-
-  regen
-        Regenerate the multi-node compose file from the current .env.
+  status            Show container status.
+  logs [service...] Tail container logs (follows).
+  sql               Interactive MySQL shell into FE-0.
+  restart           Restart all containers.
+  regen             Re-render the compose file from .env.
 
 Configuration is read from ./.env (see .env.example for defaults).
 EOF
@@ -256,13 +271,14 @@ EOF
 main() {
     local cmd="${1:-}"; shift || true
     case "$cmd" in
-        up)       cmd_up "$@" ;;
-        down)     cmd_down "$@" ;;
-        status|ps) cmd_status ;;
-        logs)     cmd_logs "$@" ;;
-        sql|mysql) cmd_sql "$@" ;;
-        restart)  cmd_restart ;;
-        regen)    ensure_env; regen_multi ;;
+        build)             cmd_build "$@" ;;
+        up)                cmd_up "$@" ;;
+        down)              cmd_down "$@" ;;
+        status|ps)         cmd_status ;;
+        logs)              cmd_logs "$@" ;;
+        sql|mysql)         cmd_sql "$@" ;;
+        restart)           cmd_restart ;;
+        regen)             cmd_regen ;;
         ""|-h|--help|help) usage ;;
         *) die "unknown command: $cmd (run '$0 --help')" ;;
     esac
