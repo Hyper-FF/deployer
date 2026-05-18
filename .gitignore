@@ -1,4 +1,6 @@
 .env
 generated/
+data/
+runtime-shared/
 packages/*
 !packages/.gitkeep

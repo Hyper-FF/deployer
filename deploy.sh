@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 #
-# StarRocks Docker Deployer
-# One-click deployment of a StarRocks cluster from a user-supplied tarball,
-# in either single-node (FE=1 + BE=1) or multi-node (N FE + M BE) topology.
+# StarRocks Docker Deployer (no docker build)
 #
 # Workflow:
 #   1. Drop StarRocks-x.y.z.tar.gz into ./packages/
-#   2. Edit .env (PACKAGE_FILE, FE_COUNT, BE_COUNT, ...)
+#   2. Edit .env  (PACKAGE_FILE, FE_COUNT, BE_COUNT, ...)
 #   3. ./deploy.sh up
 #
-# Configuration lives in .env (see .env.example).
+# 'up' extracts the tarball once into ./runtime-shared/ on the host, creates
+# per-container private data dirs under ./data/, and starts FE / BE containers
+# from the stock BASE_IMAGE with everything bind-mounted. No image build.
 
 set -euo pipefail
 
@@ -21,6 +21,8 @@ GENERATED_DIR="$SCRIPT_DIR/generated"
 COMPOSE_FILE="$GENERATED_DIR/cluster.yml"
 DEPLOY_MARKER="$GENERATED_DIR/.deployed"
 PACKAGES_DIR="$SCRIPT_DIR/packages"
+SHARED_DIR="$SCRIPT_DIR/runtime-shared"
+DATA_DIR="$SCRIPT_DIR/data"
 
 color() { printf '\033[%sm%s\033[0m\n' "$1" "$2"; }
 info()  { color "0;36" "==> $*"; }
@@ -37,7 +39,6 @@ ensure_env() {
     . "$ENV_FILE"
     set +a
     : "${PACKAGE_FILE:?PACKAGE_FILE must be set in .env}"
-    : "${IMAGE_TAG:=starrocks-local:latest}"
     : "${BASE_IMAGE:=eclipse-temurin:17-jdk-jammy}"
     : "${CLUSTER_NAME:=starrocks}"
     : "${FE_COUNT:=3}"
@@ -45,7 +46,7 @@ ensure_env() {
     : "${FE_QUERY_PORT:=9030}"
     : "${FE_HTTP_PORT:=8030}"
     : "${ROOT_PASSWORD:=}"
-    export PACKAGE_FILE IMAGE_TAG BASE_IMAGE CLUSTER_NAME \
+    export PACKAGE_FILE BASE_IMAGE CLUSTER_NAME \
            FE_COUNT BE_COUNT FE_QUERY_PORT FE_HTTP_PORT ROOT_PASSWORD
 }
 
@@ -62,32 +63,23 @@ require_docker() {
 
 # ---- helpers ------------------------------------------------------------------
 
+prepare_shared() {
+    bash "$SCRIPT_DIR/scripts/prepare.sh" "$@"
+}
+
+ensure_data_dirs() {
+    for i in $(seq 0 $((FE_COUNT - 1))); do
+        mkdir -p "$DATA_DIR/fe-$i/meta" "$DATA_DIR/fe-$i/log"
+    done
+    for i in $(seq 0 $((BE_COUNT - 1))); do
+        mkdir -p "$DATA_DIR/be-$i/storage" "$DATA_DIR/be-$i/log"
+    done
+}
+
 regen_compose() {
     mkdir -p "$GENERATED_DIR"
     bash "$SCRIPT_DIR/scripts/gen-compose.sh" > "$COMPOSE_FILE"
     info "rendered $COMPOSE_FILE  (FE=$FE_COUNT, BE=$BE_COUNT)"
-}
-
-image_exists() {
-    docker image inspect "$IMAGE_TAG" >/dev/null 2>&1
-}
-
-verify_package() {
-    local path="$PACKAGES_DIR/$PACKAGE_FILE"
-    [ -f "$path" ] || die "package not found: $path
-Put the StarRocks tarball into ./packages/ and set PACKAGE_FILE in .env."
-    # Quick structural check: expect a single top-level dir with fe/ and be/.
-    local entries
-    entries=$(tar -tzf "$path" 2>/dev/null | head -200 | awk -F/ '{print $1}' | sort -u | head -5)
-    local top
-    top=$(echo "$entries" | head -1)
-    [ -n "$top" ] || die "could not read tarball: $path"
-    if ! tar -tzf "$path" 2>/dev/null | grep -qE "^${top}/fe/bin/start_fe.sh\$"; then
-        die "tarball $PACKAGE_FILE does not contain ${top}/fe/bin/start_fe.sh"
-    fi
-    if ! tar -tzf "$path" 2>/dev/null | grep -qE "^${top}/be/bin/start_be.sh\$"; then
-        die "tarball $PACKAGE_FILE does not contain ${top}/be/bin/start_be.sh"
-    fi
 }
 
 apply_root_password() {
@@ -99,10 +91,7 @@ apply_root_password() {
         >/dev/null 2>&1 || warn "could not set root password (it may already be set)"
 }
 
-mark_deployed() {
-    mkdir -p "$GENERATED_DIR"
-    touch "$DEPLOY_MARKER"
-}
+mark_deployed() { mkdir -p "$GENERATED_DIR" && touch "$DEPLOY_MARKER"; }
 
 require_deployed() {
     [ -f "$DEPLOY_MARKER" ] || die "cluster is not deployed (run './deploy.sh up' first)"
@@ -111,36 +100,25 @@ require_deployed() {
 
 # ---- commands -----------------------------------------------------------------
 
-cmd_build() {
-    local no_cache=0
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --no-cache) no_cache=1; shift ;;
-            -h|--help) usage; exit 0 ;;
-            *) die "unknown option: $1" ;;
-        esac
-    done
+cmd_prepare() {
+    local force=0
+    [ "${1:-}" = "--force" ] && force=1
     ensure_env
-    require_docker
-    verify_package
-
-    info "building image $IMAGE_TAG from packages/$PACKAGE_FILE (base=$BASE_IMAGE)"
-    local args=(build -f runtime/Dockerfile -t "$IMAGE_TAG"
-                --build-arg "BASE_IMAGE=$BASE_IMAGE"
-                --build-arg "PACKAGE_FILE=$PACKAGE_FILE")
-    [ "$no_cache" -eq 1 ] && args+=(--no-cache)
-    docker "${args[@]}" "$SCRIPT_DIR"
-    info "image $IMAGE_TAG built"
+    if [ "$force" -eq 1 ]; then
+        prepare_shared --force
+    else
+        prepare_shared
+    fi
 }
 
 cmd_up() {
-    local mode="" fe_override="" be_override="" force_build=0
+    local mode="" fe_override="" be_override="" reprepare=0
     while [ $# -gt 0 ]; do
         case "$1" in
-            --mode)  mode="$2"; shift 2 ;;
-            --fe)    fe_override="$2"; shift 2 ;;
-            --be)    be_override="$2"; shift 2 ;;
-            --build) force_build=1; shift ;;
+            --mode)    mode="$2"; shift 2 ;;
+            --fe)      fe_override="$2"; shift 2 ;;
+            --be)      be_override="$2"; shift 2 ;;
+            --prepare) reprepare=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "unknown option: $1" ;;
         esac
@@ -150,11 +128,9 @@ cmd_up() {
     require_docker
 
     case "$mode" in
-        "")        ;;  # honour FE_COUNT/BE_COUNT from .env / overrides
-        single)    fe_override="${fe_override:-1}"; be_override="${be_override:-1}" ;;
+        "")      ;;  # honour FE_COUNT/BE_COUNT from .env / overrides
+        single)  fe_override="${fe_override:-1}"; be_override="${be_override:-1}" ;;
         multi)
-            # Only force defaults if the user has FE=1/BE=1 in .env, which would
-            # otherwise collapse to single-node.
             [ "$FE_COUNT" -eq 1 ] && [ -z "$fe_override" ] && fe_override=3
             [ "$BE_COUNT" -eq 1 ] && [ -z "$be_override" ] && be_override=3
             ;;
@@ -163,14 +139,15 @@ cmd_up() {
     [ -n "$fe_override" ] && export FE_COUNT="$fe_override"
     [ -n "$be_override" ] && export BE_COUNT="$be_override"
 
-    if [ "$force_build" -eq 1 ] || ! image_exists; then
-        cmd_build
+    if [ "$reprepare" -eq 1 ]; then
+        prepare_shared --force
     else
-        info "image $IMAGE_TAG already present (use --build to rebuild)"
+        prepare_shared
     fi
-
+    ensure_data_dirs
     regen_compose
-    info "starting cluster ($CLUSTER_NAME): FE=$FE_COUNT, BE=$BE_COUNT"
+
+    info "starting cluster ($CLUSTER_NAME): FE=$FE_COUNT, BE=$BE_COUNT, base=$BASE_IMAGE"
     "${COMPOSE[@]}" -f "$COMPOSE_FILE" --project-name "$CLUSTER_NAME" up -d
     mark_deployed
 
@@ -184,11 +161,13 @@ cmd_up() {
 }
 
 cmd_down() {
-    local prune_volumes=0 prune_image=0
+    local prune_volumes=0 prune_data=0 prune_shared=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --volumes|-v) prune_volumes=1; shift ;;
-            --image)      prune_image=1; shift ;;
+            --data)       prune_data=1; prune_volumes=1; shift ;;
+            --shared)     prune_shared=1; shift ;;
+            --all)        prune_volumes=1; prune_data=1; prune_shared=1; shift ;;
             *) die "unknown option: $1" ;;
         esac
     done
@@ -197,12 +176,19 @@ cmd_down() {
 
     local args=(down)
     [ "$prune_volumes" -eq 1 ] && args+=(-v)
-    info "stopping cluster (volumes=$prune_volumes)"
+    info "stopping cluster (volumes=$prune_volumes data=$prune_data shared=$prune_shared)"
     "${COMPOSE[@]}" -f "$COMPOSE_FILE" --project-name "$CLUSTER_NAME" "${args[@]}"
-    [ "$prune_volumes" -eq 1 ] && rm -f "$DEPLOY_MARKER"
-    if [ "$prune_image" -eq 1 ]; then
-        info "removing image $IMAGE_TAG"
-        docker image rm "$IMAGE_TAG" 2>/dev/null || warn "image $IMAGE_TAG was not present"
+
+    if [ "$prune_volumes" -eq 1 ]; then
+        rm -f "$DEPLOY_MARKER"
+    fi
+    if [ "$prune_data" -eq 1 ]; then
+        info "removing ./data/"
+        rm -rf "$DATA_DIR"
+    fi
+    if [ "$prune_shared" -eq 1 ]; then
+        info "removing ./runtime-shared/"
+        rm -rf "$SHARED_DIR"
     fi
 }
 
@@ -239,7 +225,7 @@ cmd_regen() {
 
 usage() {
     cat <<EOF
-StarRocks Docker Deployer (package-based)
+StarRocks Docker Deployer (no docker build)
 
 Workflow:
   1. cp .env.example .env  &&  edit it
@@ -247,16 +233,20 @@ Workflow:
   3. ./deploy.sh up
 
 Commands:
-  build [--no-cache]
-        Build the runtime image from ./packages/\${PACKAGE_FILE}.
+  prepare [--force]
+        Extract ./packages/\${PACKAGE_FILE} into ./runtime-shared/ on the host.
+        Called automatically by 'up'; --force re-extracts.
 
-  up [--mode single|multi] [--fe N] [--be M] [--build]
-        Deploy the cluster. Builds the image first if it does not exist
-        (or --build is given). --mode single forces FE=1,BE=1.
+  up [--mode single|multi] [--fe N] [--be M] [--prepare]
+        Deploy the cluster. Auto-extracts the package on first run.
+        --mode single forces FE=1,BE=1; --prepare forces a re-extract first.
 
-  down [--volumes|-v] [--image]
-        Stop and remove containers. --volumes also deletes data volumes;
-        --image also removes the locally built runtime image.
+  down [--volumes|-v] [--data] [--shared] [--all]
+        Stop and remove containers.
+          --volumes/-v  also remove docker volumes (apt cache, etc.)
+          --data        also wipe ./data/ (FE meta, BE storage, all logs)
+          --shared      also delete ./runtime-shared/
+          --all         all of the above
 
   status            Show container status.
   logs [service...] Tail container logs (follows).
@@ -271,7 +261,7 @@ EOF
 main() {
     local cmd="${1:-}"; shift || true
     case "$cmd" in
-        build)             cmd_build "$@" ;;
+        prepare)           cmd_prepare "$@" ;;
         up)                cmd_up "$@" ;;
         down)              cmd_down "$@" ;;
         status|ps)         cmd_status ;;

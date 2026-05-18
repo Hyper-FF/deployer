@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# FE entrypoint for cluster deployments backed by a user-supplied StarRocks tarball.
+# FE entrypoint, mounted into the container at /opt/sr-deployer/fe-entrypoint.sh.
 #
-# Behaviour:
-#   * The container's hostname must end in "-<index>" (e.g. starrocks-fe-0).
-#     Index 0 bootstraps the cluster; non-zero indexes register themselves with
-#     the leader via ALTER SYSTEM ADD FOLLOWER and start with --helper.
-#   * On subsequent restarts (FE/meta/image/ROLE present) the FE just starts.
-#   * A populated /etc/starrocks/conf directory overrides bundled FE config.
+# Expectations inside the container:
+#   /opt/starrocks/                <- shared, read-only (whole tarball)
+#   /opt/starrocks/fe/meta/        <- bind mount, private (writable)
+#   /opt/starrocks/fe/log/         <- bind mount, private (writable)
+#   /opt/starrocks/fe/conf/fe.conf <- bind mount, file overlay (read-only)
 #
 # Required env:
-#   LEADER_HOST   - hostname of FE index 0 (e.g. starrocks-fe-0)
-# Optional:
-#   FE_QUERY_PORT (default 9030), FE_EDIT_LOG_PORT (default 9010), HOST_TYPE (default FQDN)
+#   LEADER_HOST   - hostname of FE-0 (e.g. starrocks-fe-0)
+# Optional env:
+#   FE_QUERY_PORT (9030), FE_EDIT_LOG_PORT (9010), HOST_TYPE (FQDN)
 
 set -euo pipefail
 
@@ -19,29 +18,32 @@ set -euo pipefail
 FE_QUERY_PORT="${FE_QUERY_PORT:-9030}"
 FE_EDIT_LOG_PORT="${FE_EDIT_LOG_PORT:-9010}"
 HOST_TYPE="${HOST_TYPE:-FQDN}"
-
-SR_HOME="${STARROCKS_HOME:-/opt/starrocks}"
-FE_HOME="$SR_HOME/fe"
-CONF_OVERLAY="/etc/starrocks/conf"
+FE_HOME="${STARROCKS_HOME:-/opt/starrocks}/fe"
 
 log() { echo "[fe-entrypoint $(date +%H:%M:%S)] $*" >&2; }
 
-# Overlay user-provided fe.conf, if any.
-if [ -d "$CONF_OVERLAY" ]; then
-    for f in "$CONF_OVERLAY"/fe.conf "$CONF_OVERLAY"/fe.conf.d/*.conf; do
-        [ -f "$f" ] || continue
-        log "applying conf overlay: $f"
-        cp -f "$f" "$FE_HOME/conf/$(basename "$f")"
-    done
-fi
+# ---- one-time tool install (cached via shared apt volume) --------------------
+install_tools() {
+    local need=()
+    command -v mysql >/dev/null 2>&1 || need+=(default-mysql-client)
+    command -v nc    >/dev/null 2>&1 || need+=(netcat-openbsd)
+    [ ${#need[@]} -eq 0 ] && return 0
+    log "installing tools: ${need[*]}"
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y --no-install-recommends "${need[@]}" >/dev/null
+}
+install_tools
 
+# ---- derive pod index from hostname (e.g. starrocks-fe-2 -> 2) ---------------
 MYSELF="$(hostname)"
-# starrocks-fe-2 -> 2
 INDEX="${MYSELF##*-}"
 if ! [[ "$INDEX" =~ ^[0-9]+$ ]]; then
-    log "could not derive numeric pod index from hostname '$MYSELF'; assuming leader (0)"
+    log "could not derive numeric index from hostname '$MYSELF'; assuming leader (0)"
     INDEX=0
 fi
+
+mkdir -p "$FE_HOME/meta" "$FE_HOME/log"
 
 START_OPTS=(--logconsole --host_type "$HOST_TYPE")
 
@@ -57,19 +59,17 @@ if [ "$INDEX" = "0" ]; then
 fi
 
 # Follower path: wait for the leader, register, then start with --helper.
-log "waiting for leader $LEADER_HOST:$FE_QUERY_PORT to be reachable..."
+log "waiting for leader $LEADER_HOST:$FE_QUERY_PORT..."
 deadline=$(( $(date +%s) + 600 ))
 until mysql --connect-timeout 2 -h "$LEADER_HOST" -P "$FE_QUERY_PORT" \
         -u root --skip-column-names --batch -e "SHOW FRONTENDS;" >/dev/null 2>&1; do
     if [ "$(date +%s)" -ge "$deadline" ]; then
-        log "timed out waiting for leader"
-        exit 1
+        log "timed out waiting for leader"; exit 1
     fi
     sleep 2
 done
 
 log "registering self ($MYSELF:$FE_EDIT_LOG_PORT) as follower"
-# Idempotent: ignore "already exists" errors.
 mysql --connect-timeout 2 -h "$LEADER_HOST" -P "$FE_QUERY_PORT" -u root \
     --skip-column-names --batch \
     -e "ALTER SYSTEM ADD FOLLOWER \"$MYSELF:$FE_EDIT_LOG_PORT\";" 2>&1 |
